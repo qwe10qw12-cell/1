@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         🪽 Wish RP Manager Core
 // @namespace    local.rp.context.manager
-// @version      2.0.6-sub.7
+// @version      2.0.6-sub.9
 // @description  관련성 우선 회수 · Manager 날짜로그 검색 조건 이식 · 기존 정리 지침/저장 자료 보존 · 구독 및 AI 역할 분리 유지.
 // @author       User
 // @license      All Rights Reserved
@@ -59,7 +59,7 @@
   // Storage IDs, ELR contract, strict AI commit validation and rollback formats are preserved.
  let WUI=null;
 
-  const SCRIPT_VERSION = '2.0.6-sub.7';
+  const SCRIPT_VERSION = '2.0.6-sub.9';
   const EDITION = 'core';
   const RUNTIME_HOST = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // Managers without synchronous GM storage (iOS Userscripts, Greasemonkey 4) cannot keep settings; say so instead of a raw ReferenceError.
@@ -6199,7 +6199,7 @@ function open(id){const room=state.currentRoom,old=normalize(room.relationships)
       if(before.length===after.length&&before.every((e,i)=>e.id===after[i].id&&stored(e)===stored(after[i])))return;
       const render=e=>{
         if(parseDatedLogBlocks(e.summary).length)throw Error('사건 본문 안에 별도 날짜 제목이 있어 사건 경계를 확인할 수 없습니다: '+e.title);
-        const s=formatDatedLogHeading(e.date?.display,e.title)+'\n'+e.summary;
+        const s=formatDatedLogHeading(e.date?.display,preserveLogSearchTitle(e.title,old.get(e.id)?.title))+'\n'+e.summary;
         if(parseDatedLogBlocks(s).length!==1)throw Error('사건 날짜·제목 형식을 확인할 수 없습니다: '+e.title);return s;
       };
       const pieces=after.map(e=>{
@@ -6215,6 +6215,7 @@ function open(id){const room=state.currentRoom,old=normalize(room.relationships)
       let result=preamble&&!preamble.trim()?preamble:'',length=normalizeLineBreaks(result).length;
       for(const p of pieces){if(result&&p.value&&!/\n$/.test(result)){result+='\n\n';length+=2;}p.start=length;result+=p.value;length+=normalizeLineBreaks(p.value).length;}
       const parsed=parseDatedLogBlocks(result),keyById=new Map();let count=0;
+      assertNoNewLogHeadingDuplicates(blocks,parsed);
       for(const p of pieces){if(p.count>1)throw Error('사건 하나가 여러 블록으로 분리되어 적용하지 않았습니다.');if(p.count===1){const b=parsed[count++];if(!b||b.sourceStart!==p.start)throw Error('사건 경계 대응 실패: 원본을 유지했습니다.');keyById.set(p.e.id,b.key);}}
       if(count!==parsed.length)throw Error('사건 블록 수가 달라 원본을 유지했습니다.');
       const oldCounts=new Map(),newCounts=new Map();for(const b of blocks)oldCounts.set(b.key,(oldCounts.get(b.key)||0)+1);for(const b of parsed)newCounts.set(b.key,(newCounts.get(b.key)||0)+1);
@@ -10446,17 +10447,54 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
     return out;
   }
 
+  // Search hints stay in the existing heading text, so backups/raw edits need no sidecar schema.
+  // They use the same title weighting as Manager; they never gate date-log injection.
+  function normalizeLogSearchKeywords(value) {
+    const list=Array.isArray(value)?value:String(value||'').split(/[,，、\r\n]+/);
+    return [...new Set(list.map(x=>String(x||'').normalize('NFC').trim()).filter(Boolean))];
+  }
+
+  function splitLogSearchTitle(value) {
+    const text=String(value||''),marker=' | 검색어: ',at=text.indexOf(marker);
+    return at<0?{title:text,keywords:[]}:{title:text.slice(0,at),keywords:normalizeLogSearchKeywords(text.slice(at+marker.length))};
+  }
+
+  function formatLogSearchTitle(title, value) {
+    const keywords=normalizeLogSearchKeywords(value),name=String(title||'').trim()||(keywords.length?'사건':'');
+    if(name.includes(' | 검색어: ')||keywords.some(x=>/[\[\]\r\n]/.test(x)||x.includes(' | 검색어: ')))throw Error('검색 키워드에는 대괄호나 예약 구분자 " | 검색어: "를 넣을 수 없습니다.');
+    return name+(keywords.length?' | 검색어: '+keywords.join(', '):'');
+  }
+
+  function remapEditedLogQuickChoices(room, before, after, blocks) {
+    const p=room.pending;
+    if(!p||!before||!after||before.key===after.key)return;
+    const oldKey='log:'+before.key,newKey='log:'+after.key,keepOld=blocks.some(b=>b.key===before.key);
+    if(p.quickIncludes?.[oldKey]){p.quickIncludes={...p.quickIncludes,[newKey]:p.quickIncludes[oldKey]};if(!keepOld)delete p.quickIncludes[oldKey];}
+    for(const field of ['items','quickRemovedItems'])if(Array.isArray(p[field]))p[field]=p[field].flatMap(item=>{
+      if(pendingItemIdentity(item)!==oldKey)return [item];
+      const next={...item,sourceKey:after.key,slotId:'auto-log:'+after.key,title:after.titleText,content:after.raw};
+      return keepOld?[item,next]:[next];
+    });
+    p.verified=false;p.recallNeedsRefresh=true;
+  }
+
+  function preserveLogSearchTitle(title, previous) {
+    const old=splitLogSearchTitle(previous);
+    return old.keywords.length?formatLogSearchTitle(splitLogSearchTitle(title).title,old.keywords):title;
+  }
+
   function recallDocForBlock(block) {
     const signature = `${block.key}|${block.raw.length}|${simpleHash(block.raw)}`;
     // Cache only derived text: a cached block would keep its whole log version alive (block.body is a slice of it).
     let parts = LOG_RECALL_DOC_CACHE.get(signature);
     if (!parts) {
-      const merged = `${block.events} ${block.body}`.toLowerCase();
+      const fields=splitLogSearchTitle(block.events),searchTitle=[fields.title,...fields.keywords].join(' · ');
+      const merged = `${searchTitle} ${block.body}`.toLowerCase();
       parts = {
         text: merged,
         tokens: new Set(tokenizeRecallText(merged)),
-        titleLower: String(block.events || '').toLowerCase(),
-        phrases: String(block.events || '').split(/[·|｜,/]+/).map(x => x.trim().toLowerCase()).filter(x => x.length >= 2),
+        titleLower: searchTitle.toLowerCase(),
+        phrases: [...fields.title.split(/[·|｜,/]+/),...fields.keywords].map(x => x.trim().toLowerCase()).filter(x => x.length >= 2),
       };
       // 장기방에서도 캐시가 끝없이 커지지 않게 가볍게 상한을 둡니다.
       if (LOG_RECALL_DOC_CACHE.size > 1800) LOG_RECALL_DOC_CACHE.clear();
@@ -10568,7 +10606,7 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
 
   function logItemPriority(item) {
     if (item?.autoType === 'pinned-log') return 0;
-    if (item?.autoType === 'manual-log') return 1;
+    if (['manual-log','keyword-log'].includes(item?.autoType)) return 1;
     if (item?.autoType === 'recent-log') return 2;
     if (item?.autoType === 'related-log') return 3;
     if (item?.autoType === 'whole-log') return 4;
@@ -10630,8 +10668,10 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
     for (const b of blocks.filter(b => pinnedKeys.has(b.key))) put(makeLogRecallItem(b, slot, 'pinned-log', '고정로그', '사용자 고정'));
     for (const b of blocks.filter(b => manualKeys.has(b.key))) put(makeLogRecallItem(b, slot, 'manual-log', '직접로그', '사용자 직접 선택'));
 
+    for(const b of eligibleAuto){const matches=logKeywordMatches(room,b);if(matches.length)put(makeLogRecallItem(b,slot,'keyword-log','키워드로그','이번 USER 키워드 직접 호출: '+matches.join(', ')));}
+
     if (room.autoLogRecallEnabled) {
-      const occupied = new Set([...pinnedKeys, ...manualKeys]);
+      const occupied = new Set([...pinnedKeys, ...manualKeys, ...byKey.keys()]);
       const recentCount = Math.max(1, Math.min(2, Number(room.autoLogRecentBlocks) || APP.defaultRecentLogBlocks));
       const recent = selectRecentLogBlocks(eligibleAuto.filter(b => !occupied.has(b.key)), recentCount);
       for (const b of recent) put(makeLogRecallItem(b, slot, 'recent-log', '최근로그', '최신 날짜 기본 유지'));
@@ -10685,7 +10725,7 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
     const run=fast=>{
       const chosen=[],omitted=[];
       for(const item of sorted){
-        const required=['pinned-log','manual-log'].includes(item.autoType);
+        const required=['pinned-log','manual-log','keyword-log'].includes(item.autoType);
         const trial=[...baseItems,...chosen,item];
         const length=required?0:(fast?measure.contextLength(trial):buildContextBlockFromItems(trial,room).length);
         if(required||length<=limit)chosen.push(item);else omitted.push(item);
@@ -12330,6 +12370,36 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
     EXTRA_TRIGGER_CONTEXT.set(room,next);
     return !old||old.assistant!==next.assistant||old.user!==next.user;
   }
+  // Direct log recall uses this send's USER only. The shared context reader already handles reroll targets,
+  // clears on start/poll/preview, strips injected context, and keeps the full (untruncated) input.
+  const LOG_TRIGGER_BLOCKS = new WeakMap();
+  function logTriggerBlocks(room) {
+    const text=String((room?.slots||[]).find(s=>s.id==='logSummary')?.content||''),cached=LOG_TRIGGER_BLOCKS.get(room);
+    if(cached?.text===text)return cached.blocks;
+    const blocks=new Map();
+    for(const b of parseDatedLogBlocks(text))if(!blocks.has(String(b.key)))blocks.set(String(b.key),b);
+    LOG_TRIGGER_BLOCKS.set(room,{text,blocks});return blocks;
+  }
+  function logKeywordMatches(room,block) {
+    const input=EXTRA_TRIGGER_CONTEXT.get(room)?.user||'';
+    return input?splitLogSearchTitle(block?.events).keywords.filter(word=>input.includes(word)):[];
+  }
+  function logKeywordItemAllows(room,item) {
+    const slot=(room?.slots||[]).find(s=>s.id==='logSummary');
+    if(!slot?.enabled||(room.autoLogExcludedKeys||[]).map(String).includes(String(item.sourceKey)))return false;
+    const block=logTriggerBlocks(room).get(String(item.sourceKey));
+    return !!block&&block.raw===item.content&&logKeywordMatches(room,block).length>0;
+  }
+  function hasWaitingLogTriggers(room) {
+    const slot=(room?.slots||[]).find(s=>s.id==='logSummary');
+    if(!slot?.enabled||room.injectionPolicy?.logEvery===0)return false;
+    const excluded=new Set((room.autoLogExcludedKeys||[]).map(String));
+    return [...logTriggerBlocks(room).values()].some(b=>!excluded.has(String(b.key))&&splitLogSearchTitle(b.events).keywords.length>0);
+  }
+  function hasWaitingKeywordTriggers(room) {
+    return hasWaitingExtraTriggers(room)||hasWaitingLogTriggers(room);
+  }
+
   function extraTriggerMatches(room,slot) {
     const config=normalizeExtraActivation(slot?.extraActivation),context=EXTRA_TRIGGER_CONTEXT.get(room);
     if(!context)return [];
@@ -12339,6 +12409,7 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
     return slot?.group!=='extra'||normalizeExtraActivation(slot.extraActivation).mode!=='keywords'||extraTriggerMatches(room,slot).length>0;
   }
   function assertExtraTriggerPreparation(room,error) {
+    if(error&&((room.pending?.items||[]).some(i=>i.autoType==='keyword-log')||((room.slots||[]).some(s=>s.id==='logSummary'&&String(s.content||'').trim())&&[...logTriggerBlocks(room).values()].some(b=>splitLogSearchTitle(b.events).keywords.length>0))))throw new Error('날짜로그 키워드 호출에 필요한 최신 주입 상태를 확인하지 못해 전송을 중단했습니다. 잠시 뒤 다시 보내 주세요. 원인: '+String(error.message||error));
     if(error&&(room.slots||[]).some(s=>s.group==='extra'&&normalizeExtraActivation(s.extraActivation).mode==='keywords'))throw new Error('조건부 기타/OOC의 최신 주입 조건을 서버에서 확인하지 못해 전송을 중단했습니다. 잠시 뒤 다시 보내 주세요. 원인: '+String(error.message||error));
   }
   function hasWaitingExtraTriggers(room) {
@@ -12722,7 +12793,7 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
   function allFitRequired(item) {
     // The 연표 is never a 꼭 넣는 칸, even included for this session (J-1): it gives way, it never stops a send.
     const kind=injectionCadenceKind(item);
-    return kind!=='timeline'&&((item?.quickChoice?.version===2&&item.quickChoice.action==='include')||!['log','lore','relationship'].includes(kind)||['pinned-log','manual-log','pinned-lore'].includes(item.autoType));
+    return kind!=='timeline'&&((item?.quickChoice?.version===2&&item.quickChoice.action==='include')||!['log','lore','relationship'].includes(kind)||['pinned-log','manual-log','keyword-log','pinned-lore'].includes(item.autoType));
   }
   function allFitSourceStamp(room) {
     const finish=typeof WishPerformance==='undefined'?()=>{}:WishPerformance.start('sourceStamp');
@@ -13372,6 +13443,7 @@ async function chooseAllFitItems(room, items, original, query='', options={}) {
 
   function injectionCadenceAllows(room, item, cadenceTurn = 0, normalize = normalizeRoomSlots) {
     // 켜져 있으면 매 USER턴 넣습니다. cadenceTurn은 구버전/백업 호환용 진행값으로만 남깁니다.
+    if(item?.autoType==='keyword-log'&&!logKeywordItemAllows(room,item))return false;
     if(item?.group==='extra'){const slot=(room.slots||[]).find(s=>s.id===item.slotId);if(!slot||!slot.enabled||!extraTriggerAllows(room,slot))return false;}
     if(item?.group==='character'){const slot=(room.slots||[]).find(s=>s.id===item.slotId);if(!slot||!slot.enabled||slot.autoExcluded)return false;if(room.autoCharacterDetection&&!slot.autoPinned&&!characterRpDetectionEvidence(nameDetectionText(room),slot).accepted)return false;}
     return injectionEveryForItem(room, item, normalize) > 0;
@@ -13699,6 +13771,7 @@ async function chooseAllFitItems(room, items, original, query='', options={}) {
     if (item.slotId === 'currentState') return '현재상태';
     if (item.autoType === 'pinned-log') return '고정로그';
     if (item.autoType === 'manual-log') return '직접로그';
+    if (item.autoType === 'keyword-log') return '키워드로그';
     if (item.autoType === 'recent-log') return '최근로그';
     if (item.autoType === 'related-log') return '관련로그';
     if (item.slotId === 'logSummary') return '로그요약';
@@ -15520,7 +15593,7 @@ ${AI_JSON_TEXT_RULE}
   // today. The reconcile clears it before the line is read, so nothing older than that reconcile is taken, and nothing is kept where
   // no line read them (OFF, or no person passed the cheaper reads).
   let unrankedLogsRead=null;
-  function unrankedLogsInputs(room){const slot=(room?.slots||[]).find(s=>s.id==='logSummary');return [room,slot,!!slot?.enabled,slot?.content,slot?.title,slot?.retentionTurns,!!room?.autoLogRecallEnabled,room?.autoLogRecentBlocks,JSON.stringify([room?.autoLogPinnedKeys,room?.autoLogExcludedKeys,room?.manualLogSelectedKeys])];}
+  function unrankedLogsInputs(room){const slot=(room?.slots||[]).find(s=>s.id==='logSummary');return [room,slot,!!slot?.enabled,slot?.content,slot?.title,slot?.retentionTurns,!!room?.autoLogRecallEnabled,room?.autoLogRecentBlocks,EXTRA_TRIGGER_CONTEXT.get(room)?.user||'',JSON.stringify([room?.autoLogPinnedKeys,room?.autoLogExcludedKeys,room?.manualLogSelectedKeys])];}
   function keepUnrankedLogs(room,items){unrankedLogsRead={inputs:unrankedLogsInputs(room),items};return items;}
   function takeUnrankedLogs(room){
     const kept=unrankedLogsRead;unrankedLogsRead=null;
@@ -16050,8 +16123,8 @@ function loreEntrySourceHashCached(entry) { const text = loreEntrySourceText(ent
     let required=all,text=build(all);
     if(fit&&(text.length>limit||carrierBodyBytes(text)>APP.carrierByteBudget)){required=requiredFitFloor(room,all);text=build(required);}
     const total=text.length;
-    if(total>limit)throw Error('현재상태·인지·호칭·켜진 캐릭터/OOC·고정 자료와 AI 원문만으로 '+limit.toLocaleString()+'자를 넘습니다. 고정 항목 또는 이번 세션 포함 선택을 줄여 주세요. 원문과 저장 기억은 삭제하지 않았습니다.');
-    const bytes=carrierBodyBytes(text);if(bytes>APP.carrierByteBudget)throw requiredByteError(bytes,APP.carrierByteBudget);
+    if(total>limit)throw Error((all.some(i=>i.autoType==='keyword-log')?'키워드로 직접 호출한 날짜로그를 포함하여 ':'')+'현재상태·인지·호칭·켜진 캐릭터/OOC·고정 자료와 AI 원문만으로 '+limit.toLocaleString()+'자를 넘습니다. 고정 항목 또는 이번 세션 포함 선택을 줄여 주세요. 원문과 저장 기억은 삭제하지 않았습니다.'+(all.some(i=>i.autoType==='keyword-log')?' 이번 입력의 날짜로그 호출 키워드를 줄여도 됩니다.':''));
+    const bytes=carrierBodyBytes(text);if(bytes>APP.carrierByteBudget){const error=requiredByteError(bytes,APP.carrierByteBudget);if(all.some(i=>i.autoType==='keyword-log'))error.message+=' 이번 입력의 날짜로그 호출 키워드를 줄여 주세요.';throw error;}
     return total;
   }
   // The 꼭 넣는 칸 of these items, read as the items hold them (서사 고리, 인지, 호칭 whole), over the limit or the byte budget: where a
@@ -18009,12 +18082,12 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     if(!newId || !active.length){
       await restorePendingCarriers(room,p);
       p.messageId='';p.verified=false;p.verifiedAt=0;p.observedHead='';p.awaitingCarrier=!newId;p.contextBlock='';delete p.previousCarrierCleanup;delete p.reroll;
-      const completed=!!newId&&!actuallyRemaining.length&&!hasWaitingExtraTriggers(room)&&reason!=='before-send'&&reason!=='before-reroll';
+      const completed=!!newId&&!actuallyRemaining.length&&!hasWaitingKeywordTriggers(room)&&reason!=='before-send'&&reason!=='before-reroll';
       if(completed)room.pending=null;
       await saveRoom(room);clearPendingBackup(room.chatId);
       scheduleMessageInjectionMagnifier(0);
       if(completed&&room.chatId===state.currentChatId)notifyInjectionEnded(room,'completed');
-      if(reason==='start')notify(!newId?'이전 AI 답변이 없어 주입 대기 중입니다. 최신 AI에는 주입하지 않습니다.':hasWaitingExtraTriggers(room)?'기타/OOC 키워드 조건을 기다리는 중입니다.':'현재 활성 항목이 없습니다.','warn',6000);
+      if(reason==='start')notify(!newId?'이전 AI 답변이 없어 주입 대기 중입니다. 최신 AI에는 주입하지 않습니다.':hasWaitingKeywordTriggers(room)?'날짜로그·기타/OOC 키워드 호출을 기다리는 중입니다.':'현재 활성 항목이 없습니다.','warn',6000);
       return {active:active.length,waiting:!newId,cleared:completed,dormant:!completed&&!!newId};
     }
     // No cross-turn cache: reuse only this operation's immediate all-fit source read.
@@ -18178,11 +18251,11 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     room.autoRecallContextText=recentSceneText(frame);state.nameSceneByChatId.delete(String(room.chatId));
     updateExtraTriggerContext(room,frame,'start');
     const items=safeMemoryItems(room,snapshotSelectedItems(room,text));
-    if(!items.length&&!hasWaitingExtraTriggers(room))throw new Error('아직 주입할 기억이 없습니다. 몇 턴 진행하거나 보조 AI를 연결해 기억을 만든 뒤 시작해 주세요.');
+    if(!items.length&&!hasWaitingKeywordTriggers(room))throw new Error('아직 주입할 기억이 없습니다. 몇 턴 진행하거나 보조 AI를 연결해 기억을 만든 뒤 시작해 주세요.');
     // First turn: the greeting is the only scene a card under automatic detection can be named in, so a start whose enabled items
     // are only such cards is not refused for their names (the same filter with the detection off reads them as enabled); the room is
     // armed and the existing no-active-item notice says what waits. The names are read before each send and at each poll as today.
-    if(!filterItemsByInjectionCadence(room,items,0).length&&!hasWaitingExtraTriggers(room)&&!(firstTurnCarrier(frame)&&filterItemsByInjectionCadence({...room,autoCharacterDetection:false},items,0).length))throw new Error('현재 주입 설정에서 켜진 항목이 없습니다. 주입 설정 또는 선택 항목을 확인해 주세요.');
+    if(!filterItemsByInjectionCadence(room,items,0).length&&!hasWaitingKeywordTriggers(room)&&!(firstTurnCarrier(frame)&&filterItemsByInjectionCadence({...room,autoCharacterDetection:false},items,0).length))throw new Error('현재 주입 설정에서 켜진 항목이 없습니다. 주입 설정 또는 선택 항목을 확인해 주세요.');
     room.pending={messageId:'',originalText:'',contextBlock:'',items,policy:'stable-user-v1',baselineAssistantId:String(messageIdOf(frame.latest)||''),
       sessionStartedAt:Date.now(),armedAt:Date.now(),turnStartUserId:frame.latestUserId,cadenceStartUserId:frame.latestUserId,cadenceTurn:0,nextCadenceTurn:0,verified:false,carrierRole:'assistant',cognitionOverrides:{include:[],exclude:[],changedAt:0,usedAt:0}};
     for(const item of items){item.turnStartUserId=frame.latestUserId;item.usedTurns=0;}
@@ -18813,7 +18886,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
       const ed=state.v2Editor,title=overlay.querySelector('[data-v2-ed-title]')?.value??'',body=overlay.querySelector('[data-v2-ed-body]')?.value??'';
       const editSlot=['slot','state','log'].includes(ed.type)?room.slots.find(s=>s.id===(ed.type==='slot'?ed.slotId:ed.type==='state'?'currentState':'logSummary')):null;
       const editBefore=editSlot?structuredClone(editSlot):null,editRevision=room._rev,editEpoch=room._epoch;
-      const editFields=ed.type==='log'||(ed.type==='slot'&&ed.slotId==='logSummary')?['autoLogPinnedKeys','autoLogExcludedKeys','manualLogSelectedKeys']:ed.type==='slot'?['deletedCharacterKeys']:[];
+      const editFields=ed.type==='log'||(ed.type==='slot'&&ed.slotId==='logSummary')?['autoLogPinnedKeys','autoLogExcludedKeys','manualLogSelectedKeys',...(ed.type==='log'?['pending']:[])]:ed.type==='slot'?['deletedCharacterKeys']:[];
       const fieldsBefore=Object.fromEntries(editFields.map(k=>[k,{own:Object.hasOwn(room,k),value:structuredClone(room[k])}]));
       if(ed.type==='slot'){
         const s=room.slots.find(x=>x.id===ed.slotId);
@@ -18842,7 +18915,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
           const next=src.slice(0,b.sourceStart)+newRaw+tail+src.slice(b.sourceEnd),newBlocks=parseDatedLogBlocks(next);
           if(newBlocks.length!==oldBlocks.length)throw Error('날짜 수정 후 블록 수가 달라져 저장을 중단했습니다. 날짜 형식을 확인해 주세요.');
           assertNoNewLogHeadingDuplicates(oldBlocks,newBlocks);
-          s.content=next;remapLogSelectionKeysByIndex(room,oldBlocks,newBlocks);
+          s.content=next;remapLogSelectionKeysByIndex(room,oldBlocks,newBlocks);remapEditedLogQuickChoices(room,b,newBlocks[ed.index],newBlocks);
         }
       }
       updateSaveStatusUi('saving');
@@ -23043,7 +23116,7 @@ nativeBundle(d) {
     /* props: { ref, draft:{title,body} } */
     eState(d) { const x = d.draft; return sheet(d, { title: '현재상태 섹션 편집', desc: '이 섹션만 고칩니다', body: `${field('제목', inp(D(d, 'title'), x.title || ''))}${field('본문', ta(D(d, 'body'), x.body || '', '', '200'))}`, foot: `${d.canDelete === false ? '' : delBtn(d)}${SP}${closeBtn(d, '취소')}${saveBtn(d)}` }); },
     /* props: { ref, draft:{date,title,body,pin,ex} } */
-    eLog(d) { const x = d.draft; return sheet(d, { title: '날짜로그 블록 편집', desc: '날짜와 사건 제목이 같으면 같은 블록으로 봅니다', body: `<div class="m3-grid2">${field('날짜', inp(D(d, 'date'), x.date || ''))}${field('사건 제목', inp(D(d, 'title'), x.title || ''))}</div>${field('본문', ta(D(d, 'body'), x.body || '', '', '180'))}${x.pin !== undefined ? `<div class="m3-stack">${tog('항상 호출', D(d, 'pin'), x.pin, '관련도와 상관없이 매번 넣음')}${tog('자동 호출에서 제외', D(d, 'ex'), x.ex, '직접 고를 때만 들어감')}</div>` : ''}`, foot: `${delBtn(d)}${SP}${closeBtn(d, '취소')}${saveBtn(d)}` }); },
+    eLog(d) { const x = d.draft; return sheet(d, { title: '날짜로그 블록 편집', desc: '날짜와 사건 제목이 같으면 같은 블록으로 봅니다', body: `<div class="m3-grid2">${field('날짜', inp(D(d, 'date'), x.date || ''))}${field('사건 제목', inp(D(d, 'title'), x.title || ''))}</div>${field('직접 호출 키워드 (선택)', ta(D(d, 'keywords'), x.keywords || '', '', '70'), '쉼표 또는 줄바꿈으로 구분해 주세요. 이번 USER 입력에 하나라도 나오면 이 카드를 직접 포함합니다. 호출어가 없어도 기존 자동 선별은 작동합니다. 주입 끄기·제외 설정과 용량 한도는 유지됩니다.')}${field('본문', ta(D(d, 'body'), x.body || '', '', '180'))}${x.pin !== undefined ? `<div class="m3-stack">${tog('항상 호출', D(d, 'pin'), x.pin, '관련도와 상관없이 매번 넣음')}${tog('자동 호출에서 제외', D(d, 'ex'), x.ex, '직접 고를 때만 들어감')}</div>` : ''}`, foot: `${delBtn(d)}${SP}${closeBtn(d, '취소')}${saveBtn(d)}` }); },
     /* props: { isNew, ref, draft:{speaker,target,address,reg,note} } */
     eRelationship(d) {const x=d.draft;return sheet(d,{title:d.isNew?'관계·감정선 추가':'관계·감정선 편집',desc:'주체 → 대상 방향의 감정·태도입니다. 역방향은 별도 기록합니다.',body:`<div class="m3-grid2">${field('주체',inp(D(d,'speaker'),x.speaker))}${field('대상',inp(D(d,'target'),x.target))}</div>${field('현재 관계·감정의 깊이 · 700자',ta(D(d,'current'),x.current))}${field('핵심 변화 · 6,000자',ta(D(d,'trajectory'),x.trajectory),'결정적 계기와 관계적 결과만 남기고 초기·이후·현재를 구분합니다. 사건 전문은 반복하지 않습니다.')}${field('남은 쟁점 · 400자',ta(D(d,'unresolved'),x.unresolved))}${tog('이 관계 주입 사용',D(d,'enabled'),x.enabled!==false,'끄면 이 관계만 주입 후보에서 제외합니다. 저장값은 유지됩니다.')}${tog('수동 보호',D(d,'manual'),x.manual,'켜면 AI가 이 방향을 수정하지 않습니다.')}${tog('항상 주입 후보에 포함',D(d,'pinned'),x.pinned,'꺼져 있으면 현재 맥락의 CHAR 이름·별칭으로 선택합니다.')}`,foot:`${!d.isNew?delBtn(d):''}${SP}${closeBtn(d,'취소')}${saveBtn(d)}`});},
     /* props: { isNew, ref, manual, chatId, baseline:{record}, draft:{when,title,line,names,pos} } — pos: the place among the other cards (0 = 맨 앞) */
@@ -24008,7 +24081,7 @@ const WishPromptGuides=(()=>{
 function WUIEditor(type,id='',extra={}){
  const r=state.currentRoom,v=WUI_ADAPTER.vm();let d,ed;
  if(type==='state'){const b=v.state.sections.find(x=>x.id===String(id));ed={type:'state',index:Number(id)};const source=parseCurrentStateSections(r.slots.find(s=>s.id==='currentState')?.content||'')[Number(id)];d=WUI.openSheet('eState',{ref:id,canDelete:true,baseline:{kind:'state',section:source?{title:source.title,body:source.body}:null},draft:{title:b?.title||'',body:b?.body||''}});}
- if(type==='log'){const b=parseDatedLogBlocks(r.slots.find(s=>s.id==='logSummary')?.content||'')[Number(id)];ed={type:'log',index:Number(id)};d=WUI.openSheet('eLog',{ref:id,baseline:{kind:'log',block:b?{heading:b.heading,body:b.body}:null},draft:{date:b?.dateText||b?.fullDate||'',title:b?.events||'',body:b?.body||''},originalHeading:b?.heading,originalDate:b?.dateText||b?.fullDate||''});}
+ if(type==='log'){const b=parseDatedLogBlocks(r.slots.find(s=>s.id==='logSummary')?.content||'')[Number(id)],search=splitLogSearchTitle(b?.events);ed={type:'log',index:Number(id)};d=WUI.openSheet('eLog',{ref:id,baseline:{kind:'log',block:b?{heading:b.heading,body:b.body}:null},draft:{date:b?.dateText||b?.fullDate||'',title:search.title,keywords:search.keywords.join(', '),body:b?.body||''},originalHeading:b?.heading,originalDate:b?.dateText||b?.fullDate||''});}
  if(type==='slot'){const s=r.slots.find(x=>x.id===id);if(!s)return;ed={type:'slot',slotId:id};d=WUI.openSheet('eSlot',{ref:id,baseline:{kind:'slot',slotContent:s.content,...(s.group==='extra'?{extraActivation:normalizeExtraActivation(s.extraActivation)}:{})},kind:id==='currentState'?'stateRaw':id==='logSummary'?'logRaw':s.group==='character'?'char':'extra',draft:{title:s.title,aliases:(s.aliases||[]).join(', '),ret:String(s.retentionTurns),content:s.content,...(s.group==='extra'?{activationMode:normalizeExtraActivation(s.extraActivation).mode,activationKeywords:normalizeExtraActivation(s.extraActivation).keywords.join(', ')}:{})}});}
  if(type==='speech'){const s=v.speech.rows.find(x=>x.id===id);ed={type:'speech-relation',speechId:id,...(extra.reviewId?{reviewId:extra.reviewId}:{})};d=WUI.openSheet('eSpeech',{ref:id,isNew:!id,...(extra.group?{group:extra.group}:{}),draft:extra.draft||(s?{speaker:s.speaker,target:s.target,address:s.address,reg:s.reg,note:s.note}:{speaker:'',target:'',address:'',reg:'honorific',note:''})});}
  if(type==='pack'){const p=visibleLorePacksForRoom(r).find(x=>x.scopeId===id);if(p?.ownerChatId&&String(p.ownerChatId)!==String(r.chatId||''))throw Error('다른 방 소유 자료집은 읽기 전용입니다. 자료 관리 → 다른 방 자료 복사하기로 독립 사본을 만든 뒤 편집해 주세요.');ed={type:'lore-pack',packId:id};d=WUI.openSheet('ePack',{ref:id,isNew:!id,draft:{name:p?.name||'',desc:p?.description||'',auto:!!p?.autoManaged}});}
@@ -24032,7 +24105,7 @@ function WUISpeechReview(id){
 async function WUISaveEditor(d){if(d.editPath&&d.editPath!==location.pathname)throw Error('편집을 시작한 방으로 돌아온 뒤 저장해 주세요.');if(d.type==='promptGuide')return WishPromptGuides.save(d);if(d.type==='eRelationship')return WishRelationships.save(d);if(d.type==='eThread'||d.type==='eThreadClose')return WishThreads.save(d);if(d.type==='eTimeline')return WishTimeline.save(d);return await WLOG.run("편집 내용 검증·저장 중",async task=>{if(['ePack','eEntry'].includes(d.type)&&d.wishEditor?.packId){const livePack=await getCharacterLibrary(d.wishEditor.packId);if(livePack?.ownerChatId&&String(livePack.ownerChatId)!==String(state.currentRoom?.chatId||''))throw Error('다른 방 소유 자료집은 현재 방에서 수정할 수 없습니다. 독립 사본으로 복사한 뒤 편집해 주세요.');}if(d.wishSpeechParent){const p=WUI.ui.dlg(d.wishSpeechParent);if(!p)throw Error('원래 자료 편집창이 닫혔습니다.');p.draft.full=d.draft.content;return true;}if(d.type==='eEntry'&&d.draft.type==='speech'&&!String(d.draft.full||'').trim()){WUI.openSheet('eSlot',{kind:'extra',wishSpeechParent:d.id,isNew:true,draft:{title:'호칭 자료 상세 내용',content:'',ret:'0'}});notify('호칭 자료의 상세 원문도 입력해 주세요.','warn');return false;}const x=d.draft,ed=d.wishEditor||{},fields={};let action='editor-save';const set=(k,v)=>fields['[data-v2-'+k+']']=v;
  if(d.type==='eSlot'){set('ed-title',x.title);set('ed-body',x.content);set('ed-alias',x.aliases);if(d.kind==='extra'){const config=normalizeExtraActivation({mode:x.activationMode,keywords:x.activationKeywords});if(config.mode==='keywords'&&!config.keywords.length)throw Error('조건부 주입에 사용할 키워드를 하나 이상 입력해 주세요.');set('ed-extra-mode',config.mode);set('ed-extra-keywords',config.keywords.join('\n'));}}
  else if(d.type==='eState'){set('ed-title',x.title);set('ed-body',x.body);}
- else if(d.type==='eLog'){const block=parseDatedLogBlocks(state.currentRoom.slots.find(s=>s.id==='logSummary')?.content||'')[ed.index];let heading=block?.heading||d.originalHeading;if(String(x.title)!==String(block?.events||'')||String(x.date)!==String(d.originalDate||''))heading=formatDatedLogHeading(x.date||'날짜 미상',x.title||'사건');if(parseDatedLogBlocks(heading+'\n'+String(x.body||'')).length!==1)throw Error('날짜 형식을 확인해 주세요. 예: 2026년 9월 18일');set('ed-title',heading);set('ed-body',x.body);}
+ else if(d.type==='eLog'){const block=parseDatedLogBlocks(state.currentRoom.slots.find(s=>s.id==='logSummary')?.content||'')[ed.index];const searchTitle=formatLogSearchTitle(x.title,x.keywords);let heading=block?.heading||d.originalHeading;if(searchTitle!==String(block?.events||'')||String(x.date)!==String(d.originalDate||''))heading=formatDatedLogHeading(x.date||'날짜 미상',searchTitle);if(parseDatedLogBlocks(heading+'\n'+String(x.body||'')).length!==1)throw Error('날짜 형식을 확인해 주세요. 예: 2026년 9월 18일');set('ed-title',heading);set('ed-body',x.body);}
  else if(d.type==='eSpeech'){action='speech-save';for(const [key,value] of Object.entries({speaker:x.speaker,target:x.target,address:x.address,register:x.reg,note:x.note}))set('speech-'+key,value);}
  else if(d.type==='ePack'){action='lore-pack-save';set('lore-pack-name',x.name);set('lore-pack-description',x.desc);}
  else if(d.type==='eEntry'){action='lore-entry-save';const map={name:'name',type:'type',triggers:'triggers',full:'full',compact:'compact',micro:'micro',on:'enabled',anchor:'anchor'};for(const [key,field] of Object.entries(map))set('lore-entry-'+field,x[key]);set('lore-speech-note',d.originalSpeechNote||'');for(const [key,field] of Object.entries({speaker:'speaker',target:'target',address:'address',reg:'register'}))set('lore-speech-'+field,x.sp?.[key]);}
