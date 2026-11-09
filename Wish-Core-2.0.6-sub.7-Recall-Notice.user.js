@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         🪽 Wish RP Manager Core
 // @namespace    local.rp.context.manager
-// @version      2.0.7
+// @version      2.0.7.1
 // @author       User
 // @license      All Rights Reserved
 // @match        https://crack.wrtn.ai/*
@@ -59,7 +59,7 @@
   // Storage IDs, ELR contract, strict AI commit validation and rollback formats are preserved.
  let WUI=null;
 
-  const SCRIPT_VERSION = '2.0.7';
+  const SCRIPT_VERSION = '2.0.7.1';
   const EDITION = 'core';
   const RUNTIME_HOST = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // Managers without synchronous GM storage (iOS Userscripts, Greasemonkey 4) cannot keep settings; say so instead of a raw ReferenceError.
@@ -11654,7 +11654,7 @@ function remapLogSelectionKeysByMatch(room,oldBlocks,newBlocks){
   }
   function isCrackAuthError(error){return /^CRACK_AUTH_/.test(String(error?.code||''));}
   function pendingSyncIssue(pending){
-    const error=String(pending?.lastSyncError||'');
+    const error=String(pending?.lastSyncError||'')||(hasPendingCarrierCleanup(pending)?'이전 메시지의 주입 제거를 아직 확인하지 못했습니다.':'');
     return {error,authWaiting:!!error&&(isCrackAuthError({code:pending?.lastSyncErrorCode})||error.includes('로그인 토큰을 찾지 못했습니다')),lastCheckedAt:Number(pending?.verifiedAt||0)};
   }
   function recordPendingSyncError(room,error){
@@ -17431,7 +17431,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     // A manual reverify used to reattach p.contextBlock verbatim, even after
     // the user's native edit had removed a conditional OOC/log trigger.
     // Reconcile against the freshly read server frame before reusing any saved block.
-    if(hasWaitingExtraTriggers(room)||hasWaitingLogTriggers(room)){
+    if(hasWaitingExtraTriggers(room)||hasWaitingLogTriggers(room)||hasModelExtras(room)){
       const current=await reconcileStableCarrier(room,'manual-trigger-refresh',frame);
       if(current?.deferred)return current;
       p=room.pending;
@@ -17469,6 +17469,10 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     if(!verification.verified)throw new Error('저장 주입본을 다시 적용했지만 서버 본문과 일치하지 않습니다.');
     p.originalText=original;p.originalChars=original.length;p.carrierChars=expected.length;p.verified=true;p.verifiedAt=Date.now();p.serverChars=verification.serverChars;if(verification.encoding)p.carrierEncoding=verification.encoding;
     delete p.lastSyncError;delete p.lastSyncErrorCode;delete p.lastSyncErrorAt;
+    if(hasPendingCarrierCleanup(p)){
+      await restorePendingCarriers(room,{previousCarrierCleanup:p.previousCarrierCleanup,cleanupCarrierMessageIds:p.cleanupCarrierMessageIds},p.messageId);
+      delete p.previousCarrierCleanup;delete p.cleanupCarrierMessageIds;
+    }
     savePendingBackup(room.chatId,p);
     await saveRoom(room);
     if (room.chatId === state.currentChatId) state.currentRoom = room;
@@ -17479,7 +17483,9 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
   async function carrierOriginalFromServer(room, p) {
     // Read with any text it has: a carrier 1.7.2 made of a reply that was only the AI's cut copy has no own text.
     const current = await fetchMessage(apiChatIdOf(room), p.messageId, { anyText:true });
-    if (!current) return { found: false, original: '', currentText: '' };
+    // fetchMessage returns null only after the server's missing-message/full-list fallback.
+    // A known message with an empty body is NOT a confirmed deletion.
+    if (!current) return { found: false, missing:true, original: '', currentText: '' };
     const currentText = messageTextOf(current);
     const stripped = stripOurContextBlock(currentText);
     if (stripped.found) {
@@ -17493,7 +17499,8 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
 
   async function restoreCarrierOnly(room, p) {
     const info = await carrierOriginalFromServer(room, p);
-    if (!info.currentText) return { restored: false, reason: 'message_missing' };
+    if (info.missing) return { restored: false, reason: 'message_absent' };
+    if (!info.currentText) throw new Error('이전 주입 메시지의 서버 본문이 비어 있어 제거 여부를 확인할 수 없습니다: '+String(p.messageId||''));
     if (!stripOurContextBlock(info.currentText).found) return { restored: false, reason: 'already_clean' };
     const restoreText = info.original;
     if (!String(restoreText || '').trim()) throw new Error('복원할 최신 AI 원문을 찾지 못했습니다.');
@@ -17555,6 +17562,10 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
 
   // keep: the carrier the caller has just written or verified. It is never restored here, even where a cleanup chain kept from an
   // earlier failed hand-off still names it (XSEND-01: a failed write, then the newest turn deleted, made the carrier strip itself).
+  // The carrier handoff may finish only when every old block is removed,
+  // confirmed already clean, or its message is absent from the full server list.
+  // Do not silently accept a partial result as success and forget its cleanup ID.
+  function hasPendingCarrierCleanup(p){return !!p?.previousCarrierCleanup?.messageId||(Array.isArray(p?.cleanupCarrierMessageIds)&&p.cleanupCarrierMessageIds.length>0);}
   async function restorePendingCarriers(room, pending, keep='') {
     const byId=new Map(),queue=[pending],kept=String(keep||'');
     while(queue.length){
@@ -17566,9 +17577,14 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     }
     if(!byId.size)return {restored:false,reason:'waiting',results:[]};
     const results=[];
-    for(const candidate of byId.values())results.push(await restoreCarrierOnly(room,candidate));
-    const restored=results.some(result=>result.restored),missing=results.some(result=>result.reason==='message_missing');
-    return {restored,reason:restored?'ok':missing?'message_missing':results[0]?.reason||'already_clean',results};
+    for(const candidate of byId.values()){
+      const result=await restoreCarrierOnly(room,candidate);
+      results.push(result);
+      if(!['ok','already_clean','message_absent'].includes(result?.reason))
+        throw new Error('이전 주입 제거 미확인 · 메시지 '+String(candidate.messageId||'')+' · '+String(result?.reason||'unknown'));
+    }
+    const restored=results.some(result=>result.restored),absent=results.some(result=>result.reason==='message_absent');
+    return {restored,reason:restored?'ok':absent?'message_absent':results[0]?.reason||'already_clean',results};
   }
 
   function clonePendingItems(items) {
@@ -18055,7 +18071,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     const replayEpoch=ExternalReplay.revision(apiChatIdOf(room));if(ExternalReplay.pending(apiChatIdOf(room)))return {deferred:true};
     if(ExternalReplay.changed(apiChatIdOf(room),replayEpoch))return {deferred:true};
     const p=room.pending;if(!p)return {active:0,cleared:false};
-    if(hasModelExtras(room)&&(reason==='start'||reason==='before-send'||reason==='before-reroll')){
+    if(hasModelExtras(room)&&(reason==='start'||reason==='before-send'||reason==='before-reroll'||reason==='manual-trigger-refresh')){
       await WishCrackModel.prepare(room);
       const modelStamp=WishCrackModel.stamp(room),priorAssert=control?.assertActive;
       control?.captureModel?.(modelStamp);
@@ -18069,16 +18085,20 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     let frame=knownFrame||stableFrame(await fetchRecentMessages(apiChatIdOf(room),50));
     if(ExternalReplay.changed(apiChatIdOf(room),replayEpoch))return {deferred:true};
     const rid=String(apiChatIdOf(room)),headSignature=JSON.stringify(sourceManifestOf(frame.messages.slice(0,50)));
-    if(p.previousCarrierCleanup?.messageId&&p.verified===true&&p.messageId&&p.contextBlock){
-      // 이전 정리 재시도도 현재 carrier가 서버에 실제로 살아 있음을 먼저 확인합니다.
-      // 새 carrier PATCH가 실패한 복구 상태라면 예전 정상 carrier를 절대 먼저 지우지 않습니다.
+    if(hasPendingCarrierCleanup(p)&&p.verified===true&&p.messageId&&p.contextBlock){
+      // Never remove the last verified carrier before confirming that it is alive.
       const expectedCurrent=buildInjectedMessage(p.originalText,p.contextBlock),currentVerification=await verifyInjectedCarrier(room,p,expectedCurrent,1);
       if(currentVerification.verified){
-        try{await restorePendingCarriers(room,{previousCarrierCleanup:p.previousCarrierCleanup},p.messageId);delete p.previousCarrierCleanup;await saveRoom(room);}
-        catch(error){console.warn('[Wish] 이전 carrier 후속 정리 재시도 보류',error);}
+        try{
+          await restorePendingCarriers(room,{previousCarrierCleanup:p.previousCarrierCleanup,cleanupCarrierMessageIds:p.cleanupCarrierMessageIds},p.messageId);
+          delete p.previousCarrierCleanup;delete p.cleanupCarrierMessageIds;await saveRoom(room);
+        }catch(error){
+          console.warn('[Wish] 이전 carrier 후속 정리 재시도 보류',error);
+          if(reason==='before-send'||reason==='before-reroll')throw new Error('이전 주입을 제거·확인하지 못해 전송을 중단했습니다: '+String(error.message||error));
+        }
       }else{p.verified=false;p.verifiedAt=0;}
     }
-    if(reason==='poll'&&!p.lastSyncError&&!p.recallNeedsRefresh&&p.policy==='stable-user-v1'&&p.verified===true&&p.messageId&&p.messageId===String(messageIdOf(frame.carrier||firstTurnCarrier(frame))||'')&&p.contextBlock&&!p.previousCarrierCleanup&&p.observedHead===headSignature&&Date.now()-Number(p.verifiedAt||0)<APP.carrierVerifyMs)return {active:activePendingItems(p).length,unchanged:true};
+    if(reason==='poll'&&!p.lastSyncError&&!p.recallNeedsRefresh&&p.policy==='stable-user-v1'&&p.verified===true&&p.messageId&&p.messageId===String(messageIdOf(frame.carrier||firstTurnCarrier(frame))||'')&&p.contextBlock&&!hasPendingCarrierCleanup(p)&&p.observedHead===headSignature&&Date.now()-Number(p.verifiedAt||0)<APP.carrierVerifyMs)return {active:activePendingItems(p).length,unchanged:true};
     // Idle re-verify: fingerprint of everything this poll can change, so an unchanged result skips rewriting the room.
     const volatile=new Set(['verifiedAt','carrierArmedAt','serverChars','observedHead']),pollState=x=>JSON.stringify([x,room.memoryBranchBlocked,room.autoRecallContextText,Object.keys(room.aiSourceManifests||{}),Object.keys(room.aiUpdateCursors||{}),Object.keys(room.aiAppliedContent||{}),room.autoMemory?.lastError],(k,v)=>volatile.has(k)?undefined:v),pollPrint=reason==='poll'?pollState(p):'',pollRev=room._rev;
     // WishHistory verifies overlap and bounds cache age; do not bypass it with a stale frame.
@@ -18096,7 +18116,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     repairPendingTurnAnchors(room,p,frame,reason);
     if(p.policy!=='stable-user-v1'){
       await restorePendingCarriers(room,p);
-      p.messageId='';p.policy='stable-user-v1';p.turnStartUserId=frame.latestUserId;delete p.reroll;delete p.previousCarrierCleanup;
+      p.messageId='';p.policy='stable-user-v1';p.turnStartUserId=frame.latestUserId;delete p.reroll;delete p.previousCarrierCleanup;delete p.cleanupCarrierMessageIds;
       for(const item of p.items||[]){item.turnStartUserId=frame.latestUserId;item.usedTurns=0;}
     }
     await validateMemoryBranch(room,frame);
@@ -18234,7 +18254,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     let active=filterItemsByInjectionCadence(room,safeMemoryItems(room,timelineNow(activePendingItems(projected))),cadenceTurn);
     if(!newId || !active.length){
       await restorePendingCarriers(room,p);
-      p.messageId='';p.verified=false;p.verifiedAt=0;p.observedHead='';p.awaitingCarrier=!newId;p.contextBlock='';delete p.previousCarrierCleanup;delete p.reroll;
+      p.messageId='';p.verified=false;p.verifiedAt=0;p.observedHead='';p.awaitingCarrier=!newId;p.contextBlock='';delete p.previousCarrierCleanup;delete p.cleanupCarrierMessageIds;delete p.reroll;
       const completed=!!newId&&!actuallyRemaining.length&&!hasWaitingKeywordTriggers(room)&&reason!=='before-send'&&reason!=='before-reroll';
       if(completed)room.pending=null;
       await saveRoom(room);clearPendingBackup(room.chatId);
@@ -18368,11 +18388,20 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     {const fitIds=active.find(i=>injectionCadenceKind(i)==='cognition'&&i.requiredFit)?.fitIds;if(fitIds){const out=new Set(fitIds.out),short=new Set(fitIds.compact);next.cognitionIncludedIds=(next.cognitionIncludedIds||[]).filter(id=>!out.has(id));if(next.cognitionPick)next.cognitionPick={...next.cognitionPick,full:next.cognitionPick.full.filter(id=>!out.has(id)&&!short.has(id)),brief:[...next.cognitionPick.brief.filter(id=>!out.has(id)),...next.cognitionPick.full.filter(id=>short.has(id))]};}}}catch(error){console.debug('[Wish] required fit copy skipped',error);}
     // carrierEncoding: what the verified carrier went in, for the check tab's KB view. With no PATCH, kept only for the same message.
     next.verified=true;next.verifiedAt=Date.now();next.serverChars=verification.serverChars;if(verification.encoding)next.carrierEncoding=verification.encoding;else if(p.messageId!==newId)delete next.carrierEncoding;delete next.lastSyncError;delete next.lastSyncErrorCode;delete next.lastSyncErrorAt;room.pending=next;if(reason==='before-send'){if(recallBranches?.length)next.recallBranchesSend=[...recallBranches];else delete next.recallBranchesSend;}
-    // 새 carrier가 이미 검증됐으므로 이후 이전 carrier 정리가 실패해도 매턴 주입은 유지됩니다.
+    // A new carrier may be verified before old blocks are gone, but a USER send
+    // must NEVER proceed with an unresolved previous injection (including always-on/model-specific OOC).
     const cleanupCarrier=previousCarrier||next.previousCarrierCleanup,cleanupIds=Array.isArray(next.cleanupCarrierMessageIds)?next.cleanupCarrierMessageIds:[];
     if(cleanupCarrier?.messageId||cleanupIds.length){
-      try{await restorePendingCarriers(room,{...(cleanupCarrier?{previousCarrierCleanup:cleanupCarrier}:{}),cleanupCarrierMessageIds:cleanupIds},newId);delete next.previousCarrierCleanup;delete next.cleanupCarrierMessageIds;}
-      catch(error){console.warn('[Wish] 새 carrier 전환은 완료했지만 이전 carrier 정리를 다음 poll로 미룹니다.',error);}
+      try{
+        await restorePendingCarriers(room,{...(cleanupCarrier?{previousCarrierCleanup:cleanupCarrier}:{}),cleanupCarrierMessageIds:cleanupIds},newId);
+        delete next.previousCarrierCleanup;delete next.cleanupCarrierMessageIds;
+      }catch(error){
+        console.warn('[Wish] 이전 carrier 정리 미확인 · 이후 재시도',error);
+        next.lastSyncError='이전 주입 정리 미완료: '+String(error.message||error);
+        next.lastSyncErrorAt=Date.now();
+        savePendingBackup(room.chatId,next);await saveRoom(room);
+        if(sendReason)throw new Error('이전 주입을 제거·확인하지 못해 전송을 중단했습니다: '+String(error.message||error));
+      }
     }
     // The start-setup block is retired now that a context block is verified on a carrier: it left with this write where the greeting
     // is the carrier (messageOwnText); a greeting that is not the carrier is written back between sends, never before a send or reroll.
@@ -18516,7 +18545,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     if(crackAuthState.retryAt>Date.now())return Math.max(APP.idlePollMs,crackAuthState.retryAt-Date.now());
     if (document.hidden) return APP.backgroundPollMs;
     // A previous carrier whose block is still to be removed is polled at the active rate until it is.
-    if (state.currentRoom?.pending) return state.currentRoom.pending.verified && !state.currentRoom.pending.previousCarrierCleanup?.messageId ? APP.idlePollMs : APP.activePollMs;
+    if (state.currentRoom?.pending) return state.currentRoom.pending.verified && !hasPendingCarrierCleanup(state.currentRoom.pending) ? APP.idlePollMs : APP.activePollMs;
     if (state.currentRoom?.autoCharacterDetection || state.currentRoom?.autoLogRecallEnabled) return APP.idleAutoScanMs;
     return APP.idlePollMs;
   }
@@ -20250,6 +20279,9 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
           if(restoreSave)void saveRoom(currentRoom).catch(e=>console.warn('[Wish] 인지 전송 표시 복구 저장 실패',e));
           assertExtraTriggerPreparation(currentRoom,prepared.readFailed);
         }
+        // Other recoverable read failures keep their existing behavior, but
+        // unresolved previous blocks must never be passed on to the RP model.
+        if(hasPendingCarrierCleanup(currentRoom.pending))throw new Error('과거 코어 주입 정리가 완료되지 않아 전송을 중단했습니다. 서버 동기화 확인 후 다시 보내 주세요.');
       }
       // 주입·재전송이 없는 방의 기준점은 자동 정리의 생성 추적용입니다. 읽지 못하면 자동 정리가 없는 방과 같이 추적 없이 보냅니다.
       const untrackedOk=!replay&&!!currentRoom&&!currentRoom.pending&&isAiAutomationReady();let untracked=false;
@@ -24209,7 +24241,7 @@ function WUIInjectionView(room, candidates) {
  const hasOriginal=!!pending?.messageId&&!!original;
  const matchesSaved=hasOriginal&&!!block&&block===pending?.contextBlock;
  const needsRecallRefresh=relevancePolicyNeedsRefresh(room)||!!pending?.recallNeedsRefresh;
- const verified=!needsRecallRefresh&&matchesSaved&&pending?.verified===true&&!pending?.lastSyncError&&total<=allFitLimit(room);
+ const verified=!needsRecallRefresh&&matchesSaved&&pending?.verified===true&&!pending?.lastSyncError&&!hasPendingCarrierCleanup(pending)&&total<=allFitLimit(room);
  // KB view: a verified carrier counts in the encoding it went in; otherwise in the one the next PATCH would use.
  const body=carrierBody(carrierText,verified?pending.carrierEncoding:'');
  return {needsRecallRefresh,legacyExclusions:Number(pending?.quickLegacyRemovedItems?.length||0),armed:!!pending,verified,firstTurn:!!pending?.messageId&&String(pending.messageId)===String(pending.baselineAssistantId||''),total,bytes:body.bytes,encoding:body.encoding,max:allFitLimit(room),groups,items:plan,hasCarrier:!!pending?.messageId,hasOriginal,matchesSaved,selection:matchesSaved?pending.selection||null:null,review:room.lastLoreSearch?{method:room.lastLoreSearch.reviewMethod,reason:room.lastLoreSearch.reviewReason,total:room.lastLoreSearch.reviewBaseTotal,limit:room.lastLoreSearch.reviewLimit,at:room.lastLoreSearch.at}:null,...pendingSyncIssue(pending)};
