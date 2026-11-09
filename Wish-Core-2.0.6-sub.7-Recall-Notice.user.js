@@ -19100,12 +19100,16 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
     overlay.querySelector('[data-v2-editor-save]')?.addEventListener('click',async()=>{
       const ed=state.v2Editor,title=overlay.querySelector('[data-v2-ed-title]')?.value??'',body=overlay.querySelector('[data-v2-ed-body]')?.value??'';
       const editSlot=['slot','state','log'].includes(ed.type)?room.slots.find(s=>s.id===(ed.type==='slot'?ed.slotId:ed.type==='state'?'currentState':'logSummary')):null;
+      const newSlot=ed.type==='slot'&&ed.newSlot?structuredClone(ed.newSlot):null;
       const editBefore=editSlot?structuredClone(editSlot):null,editRevision=room._rev,editEpoch=room._epoch;
       const editFields=ed.type==='log'||(ed.type==='slot'&&ed.slotId==='logSummary')?['autoLogPinnedKeys','autoLogExcludedKeys','manualLogSelectedKeys',...(ed.type==='log'?['pending']:[])]:ed.type==='slot'?['deletedCharacterKeys']:[];
       const fieldsBefore=Object.fromEntries(editFields.map(k=>[k,{own:Object.hasOwn(room,k),value:structuredClone(room[k])}]));
       if(ed.type==='slot'){
-        const s=room.slots.find(x=>x.id===ed.slotId);
-        assertMemoryBaseline(room,'slot',ed.slotId,ed.baseline);
+        const s=room.slots.find(x=>x.id===ed.slotId)||newSlot;
+        if(newSlot){
+          if(room.slots.some(x=>x.id===ed.slotId))throw Error('이미 추가된 항목입니다. 목록을 다시 확인해 주세요.');
+          if(!String(body).trim())throw Error('내용을 입력한 뒤 저장해 주세요.');
+        }else assertMemoryBaseline(room,'slot',ed.slotId,ed.baseline);
         if(s){
           if(s.group==='character'||s.group==='extra'){
             s.title=title.trim()||(s.group==='character'?'새 캐릭터':'기타');
@@ -19117,6 +19121,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
           s.content=content;
           if(oldLogBlocks)remapLogSelectionKeysByMatch(room,oldLogBlocks,parseDatedLogBlocks(s.content));
           if(s.group==='character')room.deletedCharacterKeys=(room.deletedCharacterKeys||[]).filter(key=>key!==libraryItemKey(s));
+          if(newSlot)room.slots.push(s); // Commit only after the editor has supplied valid content and model conditions.
         }
       }
       else if(ed.type==='state'){const s=room.slots.find(x=>x.id==='currentState'),arr=parseCurrentStateSections(s?.content||'');assertMemoryBaseline(room,'state',ed.index,ed.baseline);if(arr[ed.index]){arr[ed.index].title=title.trim()||arr[ed.index].title;arr[ed.index].body=body;s.content=buildCurrentStateText(arr);}}
@@ -19136,6 +19141,7 @@ async function convertTextToLoreEntries(sourceText) {return await WLOG.run("텍�
       updateSaveStatusUi('saving');
       const editAfter=editSlot?structuredClone(editSlot):null,fieldsAfter=Object.fromEntries(editFields.map(k=>[k,structuredClone(room[k])]));
       try{await saveRoom(room);}catch(error){
+        if(newSlot)room.slots=room.slots.filter(s=>s!==newSlot&&s.id!==newSlot.id);
         if(room._rev===editRevision&&room._epoch===editEpoch){
           const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
           if(editSlot&&room.slots.includes(editSlot))for(const key of new Set([...Object.keys(editBefore),...Object.keys(editAfter)])){
@@ -24338,10 +24344,11 @@ function WUIEditor(type,id='',extra={}){
  const r=state.currentRoom,v=WUI_ADAPTER.vm();let d,ed;
  if(type==='state'){const b=v.state.sections.find(x=>x.id===String(id));ed={type:'state',index:Number(id)};const source=parseCurrentStateSections(r.slots.find(s=>s.id==='currentState')?.content||'')[Number(id)];d=WUI.openSheet('eState',{ref:id,canDelete:true,baseline:{kind:'state',section:source?{title:source.title,body:source.body}:null},draft:{title:b?.title||'',body:b?.body||''}});}
  if(type==='log'){const b=parseDatedLogBlocks(r.slots.find(s=>s.id==='logSummary')?.content||'')[Number(id)],search=splitLogSearchTitle(b?.events);ed={type:'log',index:Number(id)};d=WUI.openSheet('eLog',{ref:id,baseline:{kind:'log',block:b?{heading:b.heading,body:b.body}:null},draft:{date:b?.dateText||b?.fullDate||'',title:search.title,keywords:search.keywords.join(', '),body:b?.body||''},originalHeading:b?.heading,originalDate:b?.dateText||b?.fullDate||''});}
- if(type==='slot'){const s=r.slots.find(x=>x.id===id);if(!s)return;
+ if(type==='slot'){const existing=r.slots.find(x=>x.id===id),group=['extra','character'].includes(extra.newGroup)?extra.newGroup:'';
+  const s=existing|| (group?makeDynamicSlot(group,`${group==='character'?'캐릭터':'기타'} ${r.slots.filter(x=>x.group===group).length+1}`):null);if(!s)return;
   const assigned=s.group==='extra'?normalizeExtraActivation(s.extraActivation).models:[];
   const modelScope=s.group==='extra'?(Object.hasOwn(extra,'modelScope')?extra.modelScope:assigned.includes(wishExtraModelView)?wishExtraModelView:assigned[0]||''):'';
-  ed={type:'slot',slotId:id};d=WUI.openSheet('eSlot',{ref:id,modelScope,baseline:{kind:'slot',slotContent:s.content,...(s.group==='extra'?{extraActivation:normalizeExtraActivation(s.extraActivation)}:{})},kind:id==='currentState'?'stateRaw':id==='logSummary'?'logRaw':s.group==='character'?'char':'extra',draft:{title:s.title,aliases:(s.aliases||[]).join(', '),ret:String(s.retentionTurns),content:s.content,...(s.group==='extra'?{activationModels:wishModelPick(normalizeExtraActivation(s.extraActivation).models),activationMode:normalizeExtraActivation(s.extraActivation).mode,activationKeywords:normalizeExtraActivation(s.extraActivation).keywords.join(', ')}:{})}});}
+  ed={type:'slot',slotId:s.id,...(!existing?{newSlot:s}:{})};d=WUI.openSheet('eSlot',{ref:s.id,isNew:!existing,modelScope,baseline:existing?{kind:'slot',slotContent:s.content,...(s.group==='extra'?{extraActivation:normalizeExtraActivation(s.extraActivation)}:{})}:null,kind:s.id==='currentState'?'stateRaw':s.id==='logSummary'?'logRaw':s.group==='character'?'char':'extra',draft:{title:s.title,aliases:(s.aliases||[]).join(', '),ret:String(s.retentionTurns),content:s.content,...(s.group==='extra'?{activationModels:wishModelPick(modelScope?[modelScope]:normalizeExtraActivation(s.extraActivation).models),activationMode:normalizeExtraActivation(s.extraActivation).mode,activationKeywords:normalizeExtraActivation(s.extraActivation).keywords.join(', ')}:{})}});}
  if(type==='speech'){const s=v.speech.rows.find(x=>x.id===id);ed={type:'speech-relation',speechId:id,...(extra.reviewId?{reviewId:extra.reviewId}:{})};d=WUI.openSheet('eSpeech',{ref:id,isNew:!id,...(extra.group?{group:extra.group}:{}),draft:extra.draft||(s?{speaker:s.speaker,target:s.target,address:s.address,reg:s.reg,note:s.note}:{speaker:'',target:'',address:'',reg:'honorific',note:''})});}
  if(type==='pack'){const p=visibleLorePacksForRoom(r).find(x=>x.scopeId===id);if(p?.ownerChatId&&String(p.ownerChatId)!==String(r.chatId||''))throw Error('다른 방 소유 자료집은 읽기 전용입니다. 자료 관리 → 다른 방 자료 복사하기로 독립 사본을 만든 뒤 편집해 주세요.');ed={type:'lore-pack',packId:id};d=WUI.openSheet('ePack',{ref:id,isNew:!id,draft:{name:p?.name||'',desc:p?.description||'',auto:!!p?.autoManaged}});}
  if(type==='entry'){const p=visibleLorePacksForRoom(r).find(x=>x.scopeId===extra.pack),e=p?.entries.find(x=>x.id===id);if(!p)throw WLOG.tag(Error('자료집을 찾지 못했습니다.'),'LORE_GONE');if(p.ownerChatId&&String(p.ownerChatId)!==String(r.chatId||''))throw Error('다른 방 소유 자료 카드는 읽기 전용입니다. 자료 관리 → 다른 방 자료 복사하기로 독립 사본을 만든 뒤 편집해 주세요.');ed={type:'lore-entry',packId:p.scopeId,entryId:id};d=WUI.openSheet('eEntry',{ref:id,pack:p.scopeId,isNew:!id,draft:{name:e?.name||'',type:e?.type||'other',triggers:(e?.triggers||[]).join(', '),full:e?loreTextAtLevel(e,'full'):'',compact:e?.inject?.compact||e?.summary?.compact||'',micro:e?.inject?.micro||e?.summary?.micro||'',on:e?.enabled!==false,anchor:!!e?.anchor,auto:!!e?.autoManaged,sp:{speaker:e?.speechRule?.speaker||'',target:e?.speechRule?.target||'',address:e?.speechRule?.address||'',reg:e?.speechRule?.register||'honorific'}}});}
@@ -24556,7 +24563,7 @@ Object.assign(WUI_ADAPTER.act,{
  externalExport:scope=>ExternalBundles.exportFiles(scope),externalMode:mode=>{setExternalRebuildMode(mode);WUI.paint();},preciseCopy:async id=>{const d=WUI.ui.dlg(id);if(!d)return;const ok=await copyPlainText(d.prompt);d.copied=!!ok;notify(ok?'시작 문구를 복사했습니다.':'복사하지 못했습니다. 아래 칸의 글을 직접 선택해 복사해 주세요.',ok?'success':'warn',4000);WUI.paint();},externalImport:()=>ExternalBundles.importFile(),externalReviewApply:id=>ExternalBundles.apply(id),relReviewApply:id=>R31.applyRelationshipReview(id),
  relReviewExpand:arg=>{const [id,key]=arg.split('|'),d=WUI.ui.dlg(id);if(d&&!d.busy){d.draft.open[key]=!d.draft.open[key];WUI.paint();}},
  relReviewEdit:arg=>{const [id,key]=arg.split('|'),d=WUI.ui.dlg(id);if(d&&!d.busy){d.draft.editing||={};d.draft.editing[key]=!d.draft.editing[key];d.draft.open[key]=true;WUI.paint(false);}},relReviewReset:arg=>{const [id,key]=arg.split('|'),d=WUI.ui.dlg(id);if(d&&!d.busy){delete d.draft.edit[key];d.draft.reviewed=false;WUI.paint();}},relReviewMore:id=>{const d=WUI.ui.dlg(id);if(d&&!d.busy){d.draft.limit+=30;WUI.paint();}},spNew:()=>WUIEditor('speech'),spEdit:id=>WUIEditor('speech',id),charEdit:id=>WUIEditor('slot',id),xEdit:id=>WUIEditor('slot',id),
- charNew:async()=>{await WUIInvoke('add','character');WUIEditor('slot',state.v2Editor.slotId);},xNew:async()=>{const view=wishExtraModelView;await WUIInvoke('add','extra');const d=WUIEditor('slot',state.v2Editor.slotId,{modelScope:view});d.draft.activationModels=wishModelPick(view?[view]:[]);},
+ charNew:()=>WUIEditor('slot','',{newGroup:'character'}),xNew:()=>WUIEditor('slot','',{newGroup:'extra',modelScope:wishExtraModelView}),
 
  packImport:()=>WUILorePackImport(),packNew:()=>WUIEditor('pack'),packEdit:id=>WUIEditor('pack',id),enNew:pack=>WUIEditor('entry','',{pack}),enEdit:arg=>{const [pack,id]=arg.split('|');return WUIEditor('entry',id,{pack});},loreConvert:()=>openLoreConversionDialog(state.currentRoom),lcRun:id=>WUILoreConvert(WUI.ui.dlg(id)),
  acNew:()=>WUIEditor('actor'),acEdit:id=>WUIEditor('actor',id),ftNew:()=>WUIEditor('fact'),ftEdit:id=>WUIEditor('fact',id),rvSpeech:id=>WUISpeechReview(id),rvOpen:async id=>{if(!await WUIInvoke('review-open',id))return;const e=state.v2Editor;if(e?.type==='cog-fact')WUIEditor('fact',e.factId,e);else if(e?.type==='cog-actor')WUIEditor('actor',e.actorId,e);},
